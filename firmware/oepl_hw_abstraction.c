@@ -1113,6 +1113,20 @@ static bool tnb132m_write_ndef_blocks(const oepl_efr32xg22_nfcconfig_t* nfc, con
   return true;
 }
 
+// TEMPORARY SWD DIAGNOSTIC -- NOT FOR MERGE. Plain globals so a `halt`
+// (no reset, so RAM survives) can inspect them via SWD. After one write
+// attempt we read back the AI block while the chip is still powered, then
+// park the CPU in a busy-loop (never sleeps) instead of returning, so a
+// later plain `halt` doesn't hit the EM2/3 debug-clock-gated timeout we saw
+// earlier in this session. Symbol addresses (from this exact build,
+// arm-none-eabi-nm firmware/out/build/debug/EFR32xG22_OEPL.out):
+//   200025a8 b g_nfc_debug_write_ok
+//   200025a9 b g_nfc_debug_ai_read_ok
+//   200025ac b g_nfc_debug_ai
+volatile bool g_nfc_debug_write_ok;
+volatile bool g_nfc_debug_ai_read_ok;
+volatile uint8_t g_nfc_debug_ai[16];
+
 static bool tnb132m_write_ndef_message(const oepl_efr32xg22_tagconfig_t* tagcfg, const uint8_t* ndef_bytes, size_t ndef_len)
 {
   bool ok;
@@ -1131,7 +1145,22 @@ static bool tnb132m_write_ndef_message(const oepl_efr32xg22_tagconfig_t* tagcfg,
     ok = tnb132m_write_ndef_blocks(tagcfg->nfc, ndef_bytes, ndef_len);
   }
 
+  g_nfc_debug_write_ok = ok;
+  {
+    uint8_t ai_readback[16];
+    bool read_ok = tnb132m_i2c_read16(tagcfg->nfc, 0x48, 0x00, ai_readback);
+    g_nfc_debug_ai_read_ok = read_ok;
+    if(read_ok) {
+      memcpy((void*)g_nfc_debug_ai, ai_readback, 16);
+    }
+  }
+
   tnb132m_finalize_and_power_down(tagcfg);
+
+  while(1) {
+    __asm__ volatile ("nop");
+  }
+
   return ok;
 }
 
