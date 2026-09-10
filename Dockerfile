@@ -77,3 +77,11 @@ RUN \
            --gcc-toolchain="/opt/arm-gnu-toolchain-${GCC_ARM_VERSION}-x86_64-arm-none-eabi/"
 
 RUN python3 -m pip install bincopy --break-system-packages
+
+# Simplicity Commander needs libdbus-1.so.3, which is not pulled in by the
+# packages installed above on debian:trixie.
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libdbus-1-3 \
+    && rm -rf /var/lib/apt/lists/*
+USER $USERNAME
