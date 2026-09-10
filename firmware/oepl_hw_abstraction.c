@@ -21,6 +21,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "sl_udelay.h"
 #include "sl_mx25_flash_shutdown.h"
@@ -788,20 +789,397 @@ const char* oepl_hw_get_swsuffix(void)
 #endif
 }
 
+// -----------------------------------------------------------------------------
+//                    TNB132M NFC write support (3ALogics, undocumented)
+// -----------------------------------------------------------------------------
+// Ported from OpenDisplay/Firmware_Silabs (opendisplay_ble.c, od_nfc_* family:
+// od_nfc_tnb132m_prime_type3(), od_nfc_type3_paged_block_read16/write16(),
+// od_nfc_write_ndef_text_en(), od_nfc_init_sequence()), used with the original
+// author's permission. Their version bit-bangs SCL/SDA with GPIO; this port
+// uses the EFR32's hardware I2C peripheral instead (same peripheral/pins our
+// existing boot-time TNB132M capture sequence below already drives), the
+// wire-level protocol and register map are otherwise unchanged.
+//
+// Reverse-engineered I2C map (no public TNB132M datasheet):
+//   dev 0x30 sub 0x21/0x25  = control/prime registers (see the boot-time
+//                             capture a few hundred lines up in this file)
+//   dev 0x43 sub 0x30       = status/ID readback, part of the same prime step
+//   dev 0x48 sub 0x00       = Type-3 Attribute Information (AI) block:
+//                             Ver | Nbr | Nbw | Nmaxb | rsv[4] | WriteFlag |
+//                             RWFlag | Ln[3] | Checksum[2]
+//   dev 0x40 sub 0x10,0x20  = Type-3 NDEF message data, byte-offset addressed
+//                             16 bytes ("block") at a time
+// The tag only caches AI + Nbr data blocks per "anchor" (a fresh dev 0x48
+// sub 0x00 read); on our samples Nbr=2, so a full NDEF message (this driver
+// writes no TLV wrapper, just the raw NDEF message bytes + Ln) is capped at
+// 2*16 = 32 bytes. That 32-byte ceiling is also the exact boundary OpenDisplay
+// verified on hardware (a 25-character Well-Known-Text record: 4B record
+// header + 3B type/lang + 25B text = 32B).
+//
+// HW-TESTED ON THIS FORK, 2026-09-10, RESULT: NOT WORKING YET.
+// Tested oepl_hw_nfc_write_url() end-to-end on a real EL016F5C4C tag (via the
+// AP's "Set NFC URL" content card -> DATATYPE_NFC_URL_DIRECT ->
+// application_process_nfcu_block() in oepl_app.c -> this code): the block is
+// received, MD5-checked and applied (AP-side updatecount/hash advance) and
+// the tag keeps checking in normally afterward -- so this code path runs to
+// completion without crashing or destabilizing the tag. BUT the chip is not
+// then readable as an NFC Forum tag: NXP TagInfo only identifies it at the
+// raw IC level ("FeliCa, 6KB EEPROM"), and "NFC Tools" (which actively polls
+// for Type-3/FeliCa NDEF, not just iOS's passive background tag reader)
+// reads nothing at all. So whatever we're writing isn't being exposed as a
+// valid Type-3 NDEF service over RF -- either the I2C write itself is
+// silently failing (application_process_nfcu_block() never checks this
+// function's return value before recording the update as applied, so a
+// silent I2C NACK here would look identical to what we observed), or the AI
+// block we construct (Ver/Nbr/Nbw/Nmaxb/checksum) doesn't satisfy whatever
+// the chip's own RF-side firmware needs to advertise NDEF/System Code 0x12FC
+// -- that RF-facing behavior is entirely internal to the TNB132M and invisible
+// over the I2C map we've reverse-engineered.
+// NEXT STEP before trusting this code at all: get a UART debug log
+// (DPRINTF output over the debugconfig_solum EUART pins) from an actual
+// write attempt, to see whether tnb132m_i2c_write16()/tnb132m_i2c_read16()
+// are reporting success or failure -- we have no evidence either way yet.
+// oepl_hw_nfc_write_raw() (Text-record framing, matching OpenDisplay's
+// actual verified reference) has NOT been separately hardware-tested since
+// the AP UI only exposes a URL content card, not a raw-NDEF one; given
+// write_url()'s failure above, don't assume it fares any better untested.
+// ALSO NOT IMPLEMENTED: nonblocking operation (both entry points block for
+// the ~100ms of the full power-up/prime/write/power-down cycle, same as the
+// boot-time capture sequence below already does) and URI abbreviation codes
+// (oepl_hw_nfc_write_url() always uses identifier code 0x00, i.e. a literal
+// non-abbreviated URI -- correct, just not the most compact encoding).
+
+#define TNB132M_MAX_NDEF_LEN 32u
+// Bounded iteration count for the I2C_Transfer() poll loop in
+// tnb132m_i2c_transfer(): this code is reachable at runtime from AP-supplied
+// data (see application_process_nfcu_block()/nfcr_block() in oepl_app.c),
+// not just once at boot, so an unresponsive/removed TNB132M or a stuck bus
+// must not be able to hang the tag indefinitely -- bail out and let the
+// caller treat it as a failed write instead of spinning forever.
+#define TNB132M_I2C_MAX_POLL_ITERS 100000u
+
+// Single bounded-wait point every TNB132M I2C transfer below goes through.
+static I2C_TransferReturn_TypeDef tnb132m_i2c_transfer(I2C_TypeDef* i2c, I2C_TransferSeq_TypeDef* seq)
+{
+  I2C_TransferReturn_TypeDef result = I2C_TransferInit(i2c, seq);
+  uint32_t iters = 0;
+  while(result == i2cTransferInProgress && iters < TNB132M_I2C_MAX_POLL_ITERS) {
+    result = I2C_Transfer(i2c);
+    iters++;
+  }
+  if(result == i2cTransferInProgress) {
+    DPRINTF("NFC I2C transfer timed out\n");
+    return i2cTransferUsageFault;
+  }
+  return result;
+}
+
+static bool tnb132m_i2c_write16(const oepl_efr32xg22_nfcconfig_t* nfc, uint8_t dev7, uint8_t sub, const uint8_t* in16)
+{
+  I2C_TransferSeq_TypeDef i2cTransfer;
+  uint8_t txBuffer[1 + 16];
+
+  txBuffer[0] = sub;
+  memcpy(&txBuffer[1], in16, 16);
+
+  i2cTransfer.addr        = (uint16_t)(dev7 << 1);
+  i2cTransfer.flags       = I2C_FLAG_WRITE;
+  i2cTransfer.buf[0].data = txBuffer;
+  i2cTransfer.buf[0].len  = sizeof(txBuffer);
+  i2cTransfer.buf[1].data = NULL;
+  i2cTransfer.buf[1].len  = 0;
+
+  if(tnb132m_i2c_transfer(nfc->i2c, &i2cTransfer) != i2cTransferDone) {
+    DPRINTF("NFC I2C write dev=%02x sub=%02x failed\n", dev7, sub);
+    return false;
+  }
+  return true;
+}
+
+static bool tnb132m_i2c_read16(const oepl_efr32xg22_nfcconfig_t* nfc, uint8_t dev7, uint8_t sub, uint8_t* out16)
+{
+  I2C_TransferSeq_TypeDef i2cTransfer;
+  uint8_t subByte = sub;
+
+  i2cTransfer.addr        = (uint16_t)(dev7 << 1);
+  i2cTransfer.flags       = I2C_FLAG_WRITE_READ;
+  i2cTransfer.buf[0].data = &subByte;
+  i2cTransfer.buf[0].len  = 1;
+  i2cTransfer.buf[1].data = out16;
+  i2cTransfer.buf[1].len  = 16;
+
+  if(tnb132m_i2c_transfer(nfc->i2c, &i2cTransfer) != i2cTransferDone) {
+    DPRINTF("NFC I2C read dev=%02x sub=%02x failed\n", dev7, sub);
+    return false;
+  }
+  return true;
+}
+
+// Prime/finalize control writes are 1-2 bytes to dev 0x30, too small to
+// reuse the 16-byte block helpers above -- two more tiny wrappers around the
+// shared tnb132m_i2c_transfer() instead of hand-rolling I2C_TransferSeq_TypeDef
+// a third and fourth time.
+static bool tnb132m_i2c_write_reg(const oepl_efr32xg22_nfcconfig_t* nfc, uint8_t dev7, uint8_t reg, uint8_t val)
+{
+  uint8_t txBuffer[2] = {reg, val};
+  I2C_TransferSeq_TypeDef i2cTransfer;
+
+  i2cTransfer.addr        = (uint16_t)(dev7 << 1);
+  i2cTransfer.flags       = I2C_FLAG_WRITE;
+  i2cTransfer.buf[0].data = txBuffer;
+  i2cTransfer.buf[0].len  = sizeof(txBuffer);
+  i2cTransfer.buf[1].data = NULL;
+  i2cTransfer.buf[1].len  = 0;
+
+  if(tnb132m_i2c_transfer(nfc->i2c, &i2cTransfer) != i2cTransferDone) {
+    DPRINTF("NFC I2C write dev=%02x reg=%02x failed\n", dev7, reg);
+    return false;
+  }
+  return true;
+}
+
+static bool tnb132m_i2c_write_then_read_reg(const oepl_efr32xg22_nfcconfig_t* nfc, uint8_t dev7, uint8_t reg, uint8_t* out)
+{
+  uint8_t regByte = reg;
+  I2C_TransferSeq_TypeDef i2cTransfer;
+
+  i2cTransfer.addr        = (uint16_t)(dev7 << 1);
+  i2cTransfer.flags       = I2C_FLAG_WRITE_READ;
+  i2cTransfer.buf[0].data = &regByte;
+  i2cTransfer.buf[0].len  = 1;
+  i2cTransfer.buf[1].data = out;
+  i2cTransfer.buf[1].len  = 1;
+
+  if(tnb132m_i2c_transfer(nfc->i2c, &i2cTransfer) != i2cTransferDone) {
+    DPRINTF("NFC I2C write+read dev=%02x reg=%02x failed\n", dev7, reg);
+    return false;
+  }
+  return true;
+}
+
+// Power up the TNB132M and run od_nfc_tnb132m_prime_type3(): wakes the host
+// I2C interface and opens the byte-offset Type-3 data window at dev 0x40.
+// Mirrors the boot-time capture sequence above (same delays/registers) --
+// NOTE: that boot-time sequence hardcodes I2C0/GPIO->I2CROUTE[0] regardless
+// of tagconfig->nfc->i2c, while this copy parameterizes correctly on
+// nfc->i2c/i2cnum. Harmless today since every board we support still wires
+// NFC to I2C0, but the two copies will drift if that ever changes. Left the
+// boot-time copy as-is rather than refactored, to keep this port's diff
+// scoped to the write path.
+static bool tnb132m_power_up_and_prime(const oepl_efr32xg22_tagconfig_t* tagcfg)
+{
+  const oepl_efr32xg22_nfcconfig_t* nfc = tagcfg->nfc;
+
+  GPIO_PinModeSet(nfc->SCL.port, nfc->SCL.pin, gpioModeWiredAndFilter, 0);
+  GPIO_PinModeSet(nfc->SDA.port, nfc->SDA.pin, gpioModeWiredAndFilter, 0);
+  GPIO_PinModeSet(nfc->power.port, nfc->power.pin, gpioModeWiredOrPullDown, 1);
+
+  sl_udelay_wait(40000);
+
+  {
+    I2C_Init_TypeDef i2cInit = I2C_INIT_DEFAULT;
+    size_t i2cnum;
+    switch((uint32_t) nfc->i2c) {
+      #if defined(I2C0)
+      case (uint32_t) I2C0:
+        i2cnum = 0;
+        CMU_ClockEnable(cmuClock_I2C0, true);
+        break;
+      #endif
+      #if defined(I2C1)
+      case (uint32_t) I2C1:
+        i2cnum = 1;
+        CMU_ClockEnable(cmuClock_I2C1, true);
+        break;
+      #endif
+      #if defined(I2C2)
+      case (uint32_t) I2C2:
+        i2cnum = 2;
+        CMU_ClockEnable(cmuClock_I2C2, true);
+        break;
+      #endif
+      default:
+        DPRINTF("NFC: unknown I2C peripheral\n");
+        return false;
+    }
+
+    GPIO->I2CROUTE[i2cnum].SDAROUTE = (GPIO->I2CROUTE[i2cnum].SDAROUTE & ~_GPIO_I2C_SDAROUTE_MASK)
+                          | (nfc->SDA.port << _GPIO_I2C_SDAROUTE_PORT_SHIFT
+                          | (nfc->SDA.pin << _GPIO_I2C_SDAROUTE_PIN_SHIFT));
+    GPIO->I2CROUTE[i2cnum].SCLROUTE = (GPIO->I2CROUTE[i2cnum].SCLROUTE & ~_GPIO_I2C_SCLROUTE_MASK)
+                          | (nfc->SCL.port << _GPIO_I2C_SCLROUTE_PORT_SHIFT
+                          | (nfc->SCL.pin << _GPIO_I2C_SCLROUTE_PIN_SHIFT));
+    GPIO->I2CROUTE[i2cnum].ROUTEEN = GPIO_I2C_ROUTEEN_SDAPEN | GPIO_I2C_ROUTEEN_SCLPEN;
+
+    I2C_Init(nfc->i2c, &i2cInit);
+    nfc->i2c->CTRL = I2C_CTRL_AUTOSN;
+  }
+
+  if(!tnb132m_i2c_write_reg(nfc, 0x30, 0x21, 0x04)) {
+    DPRINTF("NFC prime step 1 failed\n");
+    return false;
+  }
+
+  {
+    uint8_t discard;
+    if(!tnb132m_i2c_write_then_read_reg(nfc, 0x30, 0x25, &discard)) {
+      DPRINTF("NFC prime step 2 failed\n");
+      return false;
+    }
+  }
+
+  sl_udelay_wait(20000);
+
+  {
+    uint8_t out16[16];
+    if(!tnb132m_i2c_read16(nfc, 0x43, 0x30, out16)) {
+      DPRINTF("NFC prime step 3 failed\n");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// od_nfc_init_sequence()'s trailing "0x21=0x01" write plus power-down. Always
+// called (even on a failed prime/write) so we never leave the chip powered.
+static void tnb132m_finalize_and_power_down(const oepl_efr32xg22_tagconfig_t* tagcfg)
+{
+  const oepl_efr32xg22_nfcconfig_t* nfc = tagcfg->nfc;
+
+  sl_udelay_wait(20000);
+
+  if(!tnb132m_i2c_write_reg(nfc, 0x30, 0x21, 0x01)) {
+    DPRINTF("NFC finalize write failed\n");
+  }
+
+  sl_udelay_wait(14000);
+
+  GPIO_PinOutClear(nfc->power.port, nfc->power.pin);
+  GPIO_PinModeSet(nfc->SCL.port, nfc->SCL.pin, gpioModeInput, 1);
+  GPIO_PinModeSet(nfc->SDA.port, nfc->SDA.pin, gpioModeInput, 1);
+  GPIO_PinModeSet(nfc->power.port, nfc->power.pin, gpioModeInput, 1);
+}
+
+// Ported from od_nfc_write_ndef_text_en(), generalized from a fixed Text
+// record to an arbitrary caller-supplied NDEF message. Writes the AI block
+// (preserving the chip's RWFlag) followed by up to 2 data blocks. Chip must
+// already be powered and primed (tnb132m_power_up_and_prime()).
+static bool tnb132m_write_ndef_blocks(const oepl_efr32xg22_nfcconfig_t* nfc, const uint8_t* ndef_bytes, size_t ndef_len)
+{
+  uint8_t ai[16] = {0};
+  uint8_t cur_ai[16];
+  uint8_t blocks[TNB132M_MAX_NDEF_LEN] = {0};
+  uint16_t sum = 0;
+  size_t need_blocks = (ndef_len + 15) / 16;
+
+  memcpy(blocks, ndef_bytes, ndef_len);
+
+  ai[0] = 0x10; // Ver 1.0
+  ai[1] = 0x02; // Nbr = 2 (matches the anchor-cache limit this driver assumes)
+  ai[2] = 0x01; // Nbw = 1
+  ai[3] = 0x00;
+  ai[4] = 0x3C; // Nmaxb, unchanged from the captured boot-time readback
+  ai[11] = (uint8_t)((ndef_len >> 16) & 0xFF);
+  ai[12] = (uint8_t)((ndef_len >> 8) & 0xFF);
+  ai[13] = (uint8_t)(ndef_len & 0xFF);
+
+  // Preserve RWFlag (byte 10) instead of clobbering it: read the AI that's
+  // there first, like the reference driver does.
+  if(tnb132m_i2c_read16(nfc, 0x48, 0x00, cur_ai) && cur_ai[0] == 0x10) {
+    ai[10] = cur_ai[10];
+  }
+
+  for(size_t i = 0; i < 14; i++) {
+    sum = (uint16_t)(sum + ai[i]);
+  }
+  ai[14] = (uint8_t)(sum >> 8);
+  ai[15] = (uint8_t)(sum & 0xFF);
+
+  if(!tnb132m_i2c_write16(nfc, 0x48, 0x00, ai)) {
+    DPRINTF("NFC: AI write failed\n");
+    return false;
+  }
+  sl_udelay_wait(10000);
+
+  for(size_t i = 0; i < need_blocks; i++) {
+    if(!tnb132m_i2c_write16(nfc, 0x40, (uint8_t)(0x10 + i * 0x10), &blocks[i * 16])) {
+      DPRINTF("NFC: data block %u write failed\n", (unsigned) i);
+      return false;
+    }
+    sl_udelay_wait(10000);
+  }
+
+  return true;
+}
+
+static bool tnb132m_write_ndef_message(const oepl_efr32xg22_tagconfig_t* tagcfg, const uint8_t* ndef_bytes, size_t ndef_len)
+{
+  bool ok;
+
+  if(tagcfg == NULL || tagcfg->nfc == NULL) {
+    return false;
+  }
+  if(ndef_len == 0 || ndef_len > TNB132M_MAX_NDEF_LEN) {
+    DPRINTF("NFC: NDEF message length %u out of supported range (1..%u)\n", (unsigned) ndef_len, TNB132M_MAX_NDEF_LEN);
+    return false;
+  }
+
+  if(!tnb132m_power_up_and_prime(tagcfg)) {
+    ok = false;
+  } else {
+    ok = tnb132m_write_ndef_blocks(tagcfg->nfc, ndef_bytes, ndef_len);
+  }
+
+  tnb132m_finalize_and_power_down(tagcfg);
+  return ok;
+}
+
 bool oepl_hw_nfc_write_url(const uint8_t* url_buffer, size_t length)
 {
   // Todo: implement nonblocking I2C driver for NFC
-  (void) url_buffer;
-  (void) length;
-  return false;
+  const oepl_efr32xg22_tagconfig_t* tagcfg = oepl_efr32xg22_get_config();
+  if(tagcfg == NULL || tagcfg->nfc == NULL) {
+    return false;
+  }
+
+  // Wrap into an NFC Forum "URI" well-known record (TNF=0x01, type='U').
+  // See the file-header comment above: this path is NOT YET verified on
+  // real hardware. Always uses URI identifier code 0x00 (literal, no
+  // abbreviation) -- correct but not the most compact encoding.
+  if(length > TNB132M_MAX_NDEF_LEN - 5) {
+    // 4B NDEF record header + 1B URI ID code must still fit next to the URL
+    DPRINTF("NFC: URL too long for TNB132M Nbr=2 cache (max %u chars)\n", TNB132M_MAX_NDEF_LEN - 5);
+    return false;
+  }
+
+  uint8_t record[TNB132M_MAX_NDEF_LEN];
+  size_t plen = 1 + length; // URI ID code + URL bytes
+
+  record[0] = 0xD1; // MB=1 ME=1 CF=0 SR=1 IL=0 TNF=001 (well-known)
+  record[1] = 0x01; // type length
+  record[2] = (uint8_t) plen;
+  record[3] = 0x55; // type = 'U'
+  record[4] = 0x00; // URI identifier code: no abbreviation
+  memcpy(&record[5], url_buffer, length);
+
+  return tnb132m_write_ndef_message(tagcfg, record, 4 + plen);
 }
 
 bool oepl_hw_nfc_write_raw(const uint8_t* raw_buffer, size_t length)
 {
   // Todo: implement nonblocking I2C driver for NFC
-  (void) raw_buffer;
-  (void) length;
-  return false;
+  const oepl_efr32xg22_tagconfig_t* tagcfg = oepl_efr32xg22_get_config();
+  if(tagcfg == NULL || tagcfg->nfc == NULL) {
+    return false;
+  }
+
+  // The AP is expected to hand us a complete, already-encoded NDEF message
+  // (any record type); we place it in the tag's Type-3 data area verbatim
+  // and update Ln accordingly. This is the path that has actually been
+  // verified against a real NFC reader (as a Well-Known-Text record) -- see
+  // the file-header comment above.
+  return tnb132m_write_ndef_message(tagcfg, raw_buffer, length);
 }
 
 static void deepsleep_timer_cb(sl_sleeptimer_timer_handle_t *handle, void *data)
