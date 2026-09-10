@@ -35,5 +35,10 @@
 - ~~Figure out why power consumption in sleep is so high~~
   - ~~Figure out how the FD pin can be setup to wake us from EM4~~
 - Implement NFC (pending TNB132M config documentation)
+  - WIP on branch `testing/nfc-tnb132m-i2c`: ported the I2C write logic from
+    OpenDisplay/Firmware_Silabs, runs on real hardware without crashing but
+    the written NDEF isn't readable by a phone yet -- see
+    `documentation/tnb132m/nfc-write-port-notes.md` for the full writeup and
+    next debugging step. Not ready to merge.
 - Get rid of CPP runtime
   - Not worth it?
